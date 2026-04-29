@@ -73,5 +73,3 @@ docs/dataset.md
 docs/borrowed_ideas.md
 docs/reviews/
 
-# Lab-only reference copy of upstream source (e.g., PRISM); never commit
-prism_reference/

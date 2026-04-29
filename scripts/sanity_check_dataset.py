@@ -64,6 +64,15 @@ def main() -> int:
     )
     log.info("dataset built, %d cases in fold %d / %s", len(ds), args.fold, args.split)
 
+    # Filter to cases that actually exist on disk (sync may be incomplete).
+    keep_idx = [i for i, p in enumerate(ds.image_paths) if Path(p).exists()]
+    log.info("cases present on disk: %d / %d", len(keep_idx), len(ds))
+    if not keep_idx:
+        log.error("no cases found on disk under %s; sync may not have started", data_root)
+        return 2
+    ds.image_paths = [ds.image_paths[i] for i in keep_idx]
+    ds.label_paths = [ds.label_paths[i] for i in keep_idx]
+
     loader = build_loader(ds, batch_size=1, num_workers=2, shuffle=False)
 
     n_seen = 0

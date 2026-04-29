@@ -21,9 +21,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from monai.transforms import (
-    BinarizeLabeld,
     Compose,
     CropForegroundd,
+    MapTransform,
     NormalizeIntensityd,
     RandCropByPosNegLabeld,
     RandFlipd,
@@ -36,6 +36,23 @@ from monai.transforms import (
     SpatialPadd,
 )
 from torch.utils.data import Dataset
+
+
+class BinarizeLabeld(MapTransform):
+    """Threshold a label map to {0, 1}; PRISM uses this for binary tumor masks (R-Smoke.Mask)."""
+
+    def __init__(self, keys, threshold: float = 0.5, allow_missing_keys: bool = False) -> None:
+        super().__init__(keys, allow_missing_keys)
+        self.threshold = threshold
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.key_iterator(d):
+            tensor = d[key]
+            if not isinstance(tensor, torch.Tensor):
+                tensor = torch.as_tensor(tensor)
+            d[key] = (tensor > self.threshold).to(tensor.dtype)
+        return d
 
 
 @dataclass

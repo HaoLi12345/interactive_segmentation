@@ -99,4 +99,9 @@ def _build_sam3D_ori(
         else:
             sam.load_state_dict(state_dict["model_state_dict"])
 
+    # NOTE: PRISM's image_encoder is a true 3D ViT (patch_embed (768, 1, 16, 16, 16),
+    # pos_embed (1, 8, 8, 8, 768), 384-channel neck). Raw SAM ViT-B (2D, 256 neck)
+    # is architecturally incompatible — that's why PRISM master left --checkpoint_sam
+    # dead. For warm-start, use args.use_sam3d_turbo (SAM-Med3D 3D-pretrained ckpt)
+    # or pass a PRISM-trained ckpt via the ``checkpoint`` arg.
     return sam

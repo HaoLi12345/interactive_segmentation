@@ -1,0 +1,39 @@
+# Core deep-learning stack
+# Install PyTorch separately per platform (A6000: x86_64+CUDA12.6, GH200: aarch64).
+# Pinned minimums chosen to match Project-MONAI/VISTA and MIC-DKFZ/nnInteractive expectations.
+torch>=2.4
+torchvision>=0.19
+
+# Medical imaging
+monai>=1.4
+nibabel>=5.2
+SimpleITK>=2.3
+batchgenerators>=0.25
+torchio>=0.20
+connected-components-3d>=3.18
+surface-distance>=0.1
+
+# Foundation-model baselines (inference-only — see R-Method.NoTrainBaselines)
+huggingface_hub>=0.24
+
+# Numerics / utilities
+numpy>=1.26
+scipy>=1.13
+scikit-image>=0.22
+einops>=0.8
+pandas>=2.2
+PyYAML>=6.0
+tqdm>=4.66
+
+# Logging / experiment tracking
+tensorboard>=2.16
+
+# Visualization
+matplotlib>=3.8
+Pillow>=10.0
+opencv-python>=4.10
+
+# Optional, used by ablations / future smarter-prompt strategies
+# peft>=0.12          # LoRA
+# kornia>=0.7         # used by some segmentation utilities
+# MedPy>=0.5          # legacy metrics; keep optional

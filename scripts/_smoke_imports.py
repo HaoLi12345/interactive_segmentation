@@ -1,0 +1,18 @@
+"""Verify all heavy DL deps + our model factory + trainer + evaluator import cleanly."""
+import sys
+sys.path.insert(0, "/home/lih30/interactive_seg")
+print("python:", sys.version.split()[0])
+import torch; print("torch:", torch.__version__)
+import torchvision; print("torchvision:", torchvision.__version__)
+import monai; print("monai:", monai.__version__)
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator; print("segment-anything: OK")
+import surface_distance; print("surface-distance: OK")
+from src.config.loader import load_yaml; print("config: OK")
+from src.data.datasets import build_dataset, build_loader; print("data: OK")
+from src.models.build import build_image_encoder, build_prompt_encoders, build_mask_decoder, build_model; print("models: OK")
+from src.prompts.click_sim import sample_clicks; print("prompts: OK")
+from src.trainer import Trainer; print("trainer: OK")
+from src.evaluator import run_n_click_eval, evaluate_one_case; print("evaluator: OK")
+cfg = load_yaml("/home/lih30/interactive_seg/configs/base/config.yaml")
+print("cfg loaded:", cfg.experiment.name, cfg.data.dataset)
+print("ALL IMPORTS OK")

@@ -109,11 +109,29 @@ class Refine(nn.Module):
         self.conv_error_map = Conv["conv", 3](in_channels=out_channel, out_channels=1, kernel_size=1)
         self.conv_correction = Conv["conv", 3](in_channels=out_channel, out_channels=1, kernel_size=1)
 
+        self.initial_seg_layer1 = Conv["conv", 3](in_channels=1, out_channels=16, kernel_size=1)
+        self.initial_seg_layer2 = Conv["conv", 3](in_channels=16, out_channels=16, kernel_size=1)
+        self.initial_seg_layer3 = Conv["conv", 3](in_channels=16, out_channels=1, kernel_size=1)
+        self.relu = nn.ReLU()
+        self.norm = nn.BatchNorm3d(1)
 
     def forward(self, image, mask_best, points, mask):
-
         x = self._get_refine_input(image, mask_best, points)
+    # def forward(self, image, mask):
+    #     x = image
+    #     x = F.interpolate(x, scale_factor=0.5, mode='trilinear')
+
+
         mask = F.interpolate(mask, scale_factor=0.5, mode='trilinear', align_corners=False)
+
+        mask_original = mask.clone()
+        mask = self.initial_seg_layer1(mask) # try to convert binary mask into logic
+        mask = self.initial_seg_layer2(mask)
+        mask = self.initial_seg_layer3(mask)
+        mask = self.relu(self.norm(mask))
+        mask = mask + mask_original
+
+
 
         x = self.first_conv(x)
 
@@ -133,6 +151,7 @@ class Refine(nn.Module):
         outputs = F.interpolate(outputs, scale_factor=2, mode='trilinear', align_corners=False)
         error_map = F.interpolate(error_map, scale_factor=2, mode='trilinear', align_corners=False)
         return outputs, error_map
+
 
     def _get_refine_input(self, image, mask, points):
         mask = torch.sigmoid(mask)
@@ -191,4 +210,3 @@ class MLP(nn.Module):
         if self.sigmoid_output:
             x = torch.sigmoid(x)
         return x
-

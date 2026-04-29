@@ -130,8 +130,15 @@ class BaseVolumeDataset(Dataset):
         # RandCropByPosNegLabeld returns a list of crops with num_samples=1.
         if isinstance(out, list):
             out = out[0]
+        # PRISM convention: triplicate the single CT channel to match the SAM
+        # ViT-B image encoder's expected 3-channel input. Required even when
+        # not warm-starting from SAM (in_chans=3 is hardcoded in PatchEmbed).
+        image = out["image"]
+        if not isinstance(image, torch.Tensor):
+            image = torch.as_tensor(image)
+        image = image.repeat(3, 1, 1, 1)
         return {
-            "image": out["image"],
+            "image": image,
             "label": out["label"].squeeze(0),
             "spacing": torch.from_numpy(spacing.astype(np.float32)),
             "image_path": self.image_paths[idx],

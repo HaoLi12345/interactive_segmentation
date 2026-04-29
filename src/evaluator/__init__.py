@@ -126,7 +126,8 @@ def evaluate_one_case(
         ],
         axis=1,
     ).astype(np.int64)
-    points = torch.from_numpy(local_coords).long().unsqueeze(0).to(device)
+    # Float — prompt encoder grid_sample requires Float (PRISM convention).
+    points = torch.from_numpy(local_coords).float().unsqueeze(0).to(device)
 
     logits = predict_patch(img_patch, points, patch_size, model_dict, device)
     pred_patch = F.softmax(logits, dim=1)[:, 1]

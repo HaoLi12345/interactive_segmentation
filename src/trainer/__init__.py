@@ -68,7 +68,9 @@ def _sample_train_clicks(
             n_neg=0,
         )
         coords = bg_coords
-    return torch.from_numpy(coords).long().unsqueeze(0).to(device)
+    # Float — grid_sample inside the prompt encoder requires Float coords
+    # (PRISM does .float() in src/utils/util.py:get_points).
+    return torch.from_numpy(coords).float().unsqueeze(0).to(device)
 
 
 def _model_forward(
@@ -240,7 +242,10 @@ class Trainer:
 
         losses = []
         t0 = time.time()
+        max_steps = self.cfg.train.get("max_steps_per_epoch", 0) if hasattr(self.cfg.train, "get") else 0
         for idx, batch in enumerate(self.train_loader):
+            if max_steps and idx >= max_steps:
+                break
             img, seg = batch["image"], batch["label"]
             masks = _model_forward(
                 img, seg, self.model_dict, patch_size, self.device,

@@ -26,8 +26,10 @@ env/
 .DS_Store
 
 # Data — never commit raw images or large binaries
-# Anchored at repo root so it doesn't match src/data/
-/data/
+# Anchored at repo root so it doesn't match src/data/.
+# Plain ``data`` covers both real dirs and symlinks (which is the ACCRE setup).
+/data
+/outputs
 *.nii
 *.nii.gz
 *.dcm
@@ -36,6 +38,7 @@ env/
 *.h5
 *.pkl
 !docs/**/*.pkl
+!splits/*.pkl
 
 # Outputs — checkpoints, logs, predictions
 *.pth
@@ -44,7 +47,6 @@ env/
 
 # SLURM stdout/stderr
 slurm-*.out
-/outputs/
 /results/*.png
 /results/*.pdf
 
@@ -59,6 +61,7 @@ secrets.yaml
 # Local-only scratch (Chinese notes, etc.)
 scratch/
 *.local.md
+scratch_*.log
 
 # Collaboration / agent-coordination docs — kept locally but not on GitHub
 # (GitHub repo holds only DL code: src/, scripts/, configs/, slurm/templates/, requirements.txt, README.md)

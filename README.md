@@ -1,8 +1,6 @@
 # Sparse, Revision-aware Interactive 3D Tumor Segmentation
 
-PyTorch implementation accompanying the paper *"Sparse-slice Scribble
-Training and Revision-aware Refinement for Interactive 3D Tumor
-Segmentation"* (in submission).
+
 
 The model extends [PRISM](https://arxiv.org/abs/2404.15028) with two
 contributions:
@@ -145,20 +143,5 @@ src/
 requirements.txt  Python dependencies (install torch separately for your CUDA).
 ```
 
-## Acknowledgements
 
-The image encoder, prompt encoder, and base refine head are ported from
-[MedICL-VU/PRISM](https://github.com/MedICL-VU/PRISM). The 3D SAM
-backbone is initialized from
-[facebookresearch/segment-anything](https://github.com/facebookresearch/segment-anything).
 
-## Citation
-
-```bibtex
-@article{li2026sparse,
-  title   = {Sparse-slice Scribble Training and Revision-aware Refinement for Interactive 3D Tumor Segmentation},
-  author  = {Hao Li and {others}},
-  journal = {in submission},
-  year    = {2026},
-}
-```

@@ -76,3 +76,14 @@ docs/dataset.md
 docs/borrowed_ideas.md
 docs/reviews/
 
+
+# Excluded from GitHub release — keep code only.
+# These directories still exist locally on ACCRE but are not pushed.
+/configs/
+/scripts/
+/slurm/
+/splits/
+/paper_v2/
+/results/
+/ppt/
+/tests/

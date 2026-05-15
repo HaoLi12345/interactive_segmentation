@@ -1,58 +1,164 @@
-# interactive_seg
+# Sparse, Revision-aware Interactive 3D Tumor Segmentation
 
-3D interactive medical-image segmentation with smarter prompting.
+PyTorch implementation accompanying the paper *"Sparse-slice Scribble
+Training and Revision-aware Refinement for Interactive 3D Tumor
+Segmentation"* (in submission).
 
-## Idea
+The model extends [PRISM](https://arxiv.org/abs/2404.15028) with two
+contributions:
 
-Given a strong public 3D segmentation backbone, **smarter click selection** + **prompt curriculum borrowed from current SOTA** beats vanilla random-FP/FN click sampling under the same n-click protocol. The headline figure is *Dice vs #clicks* on KiTS21 and MSD-Colon, comparing PRISM, VISTA3D, nnInteractive, and ours.
+1. **3-state revision-aware refine input** — a contradiction map next to
+   the usual positive / negative click maps, so the refine head has a
+   defined input state when a voxel is relabeled across rounds.
+2. **Sparse-slice scribble training** — at each training step, scribbles
+   are kept only on a few high-error slices along a randomly chosen
+   anatomical axis, so the model learns to extrapolate 3D corrections
+   from a small number of 2D anchor slices.
 
-- **Backbone:** PRISM architecture (selectively ported, modernized to PyTorch 2.4+).
-- **Borrowed ideas (inference-only baselines):**
-  - VISTA3D — three-state click (positive / negative / **ignore**), auto + click dual training mode
-  - nnInteractive — multi-prompt curriculum (point → scribble → box → lasso), nnUNet-style data preprocessing
-- **Our contribution:** click selection strategies (uncertainty-aware, boundary-aware, FN/FP top-1, expected-information-gain).
-- **Datasets:** KiTS21 (kidney tumor), MSD-Colon (colon tumor). PRISM split files reused verbatim.
+The training, inference, and stress-test scripts are kept compatible
+with the original PRISM pipeline so prior results can be reproduced from
+the same checkpoints by toggling CLI flags.
 
-## Layout
-
-| Path | Purpose |
-|---|---|
-| `src/` | Library code: `config/`, `data/`, `models/`, `prompts/`, `losses/`, `trainer/`, `evaluator/`, `metrics/`, `utils/` |
-| `scripts/` | Entry points: `train_finetune.py`, `eval_zeroshot.py`, `eval_ours.py`, `benchmark_inference.py` |
-| `configs/` | YAML configs: `base/` and `exp/<name>/` |
-| `slurm/` | Submission scripts: `templates/{a6000,gh200}.slurm` (do not edit in place), `exp_*.slurm` |
-| `docs/` | `handoff.md`, `decision_log.md`, `technical.md`, `dataset.md`, `borrowed_ideas.md` |
-| `outputs/` | Checkpoints, logs (gitignored) |
-| `results/` | Selected CSVs / figures for paper |
-| `data/` | Symlinks only — never raw images |
-| `splits/` | PRISM split.pkl files (committed; ~100 KB) |
-
-## Conventions
-
-Read `CLAUDE.md` and `AGENTS.md` before making changes. Key rules:
-
-- All git-tracked files in English.
-- No "Claude" anywhere in commit metadata or PR body.
-- No data under `/home/lih30/` on ACCRE — use `/data/h_oguz_lab/lih30/`.
-- VISTA3D and nnInteractive are inference-only; do not train.
-- PRISM `split.pkl` files are reused verbatim.
-- Smoke test verifies *numbers*, not "code didn't crash".
-
-## Compute
-
-ACCRE only (lab machine for code editing / data inspection):
+## Setup
 
 ```bash
-sbatch slurm/templates/a6000.slurm   # accre_guests_acc + nvidia_rtx_a6000:1
-sbatch slurm/templates/gh200.slurm   # h_oguz_lab_acc + nvidia_gh200:1 (preferred)
+git clone https://github.com/HaoLi12345/interactive_segmentation.git
+cd interactive_segmentation
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+# Then install a torch build matching your CUDA / hardware, e.g.
+pip install torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
 ```
 
-## Datasets
+## Data
 
-| Dataset | Source | Lab path | ACCRE path |
-|---|---|---|---|
-| KiTS21 | github.com/neheller/kits21 | `/media/hao/easystore/.../0SAM_data/kist_update/data/` | `/data/h_oguz_lab/lih30/interactive_seg_data/kits21/` |
-| MSD-Colon | medicaldecathlon.com (Task10_Colon) | `/media/hao/easystore/.../0SAM_data/Task10_Colon/` | `/data/h_oguz_lab/lih30/interactive_seg_data/msd_colon/` |
-| PRISM splits | — | `/media/hao/easystore/.../promise/datafile/{kits,colon}/split.pkl` | `splits/` (committed) |
+Two public tumor benchmarks are supported.
 
-Details in `docs/dataset.md`.
+* **KiTS21 kidney tumor** — `https://github.com/neheller/kits21`. Place
+  one case per subdirectory:
+  ```
+  <data_root>/kits21/case_00000/imaging.nii.gz
+  <data_root>/kits21/case_00000/aggregated_MAJ_seg.nii.gz
+  <data_root>/kits21/split.pkl
+  ```
+* **MSD-Colon (Task10_Colon)** —
+  `http://medicaldecathlon.com`. Layout:
+  ```
+  <data_root>/msd_colon/imagesTr/colon_<NNN>.nii.gz
+  <data_root>/msd_colon/labelsTr/colon_<NNN>.nii.gz
+  <data_root>/msd_colon/split.pkl
+  ```
+
+The accompanying `split.pkl` files are the verbatim PRISM 5-fold splits.
+The dataloader expects `<data_root>/<dataset>/split.pkl`; see
+`src/dataset/dataloader.py` for the exact format if you want to
+regenerate them.
+
+Pre-trained backbone weights (SAM ViT-B): download
+`sam_vit_b_01ec64.pth` from
+`https://github.com/facebookresearch/segment-anything` and place under
+`./checkpoint_sam/sam_vit_b_01ec64.pth`.
+
+## Train
+
+Sparse-scribble revision-aware training on MSD-Colon:
+
+```bash
+python src/train.py \
+    --data colon \
+    --data_dir <data_root>/msd_colon \
+    --save_dir ./outputs \
+    --save_name ours \
+    --iter_nums 11 --num_clicks 1 \
+    --multiple_outputs --refine --use_box \
+    --use_scribble --efficient_scribble \
+    --use_3state_memory \
+    --sparse_scribble_train --sparse_scribble_K_max 5 \
+    --sparse_scribble_dense_prob 0.2 \
+    --sparse_scribble_orientations axial,sagittal,coronal \
+    --image_size 128 --batch_size 1 --num_workers 4 \
+    --max_epoch 200 --lr 4e-5
+```
+
+KiTS21 is the same with `--data kits --data_dir <data_root>/kits21`.
+
+To reproduce the PRISM baseline, omit `--use_3state_memory` and
+`--sparse_scribble_*`; this matches the public PRISM training recipe
+exactly.
+
+## Inference
+
+### Standard PRISM-ultra protocol
+
+```bash
+python src/test.py \
+    --data colon \
+    --data_dir <data_root>/msd_colon \
+    --save_dir ./outputs --save_name ours --checkpoint best \
+    --split test \
+    --iter_nums 11 --num_clicks 1 --num_clicks_validation 10 \
+    --multiple_outputs --refine --refine_test --use_box \
+    --use_scribble --efficient_scribble \
+    --use_3state_memory \
+    --image_size 128 --batch_size 1 --num_workers 0
+```
+
+### Sparse scribbles (`K` informative slices)
+
+Restrict the test-time scribble to the top-`K` residual-error slices
+along a per-case random orientation:
+
+```bash
+python src/test.py ... \
+    --test_K_slices 3 \
+    --test_slice_orientation random
+```
+
+`K=1`, `K=3`, `K=5` reproduce the sparse-prompt results in the paper.
+
+### Prompt-revision stress test
+
+Inject relabeled prompts across rounds (`N` voxels per round):
+
+```bash
+python src/test.py ... \
+    --test_K_slices 3 --test_slice_orientation random \
+    --inter_iter_contradiction_N 100
+```
+
+Per-iteration Dice is emitted as `ITERDICE path=... iter=K dice=Y` log
+lines; combined with `--save_per_iter_predictions` you also get the mask
+nii.gz at every iteration under
+`<save_test_dir>/per_iter_pred/<data>/<save_name>/<case_id>/`.
+
+## Repository layout
+
+```
+src/
+  config/         Argparse-based configuration (config_args.py).
+  dataset/        Dataset + dataloader (loads <data_root>/<ds>/split.pkl).
+  models/         3D ViT image encoder, prompt encoder, mask decoder + 3-state Refine head.
+  processor/      trainer.py (Trainer), trainer_basic.py (base loop), tester.py, validater.py.
+  utils/          Scribble helpers, boundary utilities, plotting.
+  train.py        Training entry point.
+  test.py         Evaluation entry point (standard / sparse / revision protocols).
+requirements.txt  Python dependencies (install torch separately for your CUDA).
+```
+
+## Acknowledgements
+
+The image encoder, prompt encoder, and base refine head are ported from
+[MedICL-VU/PRISM](https://github.com/MedICL-VU/PRISM). The 3D SAM
+backbone is initialized from
+[facebookresearch/segment-anything](https://github.com/facebookresearch/segment-anything).
+
+## Citation
+
+```bibtex
+@article{li2026sparse,
+  title   = {Sparse-slice Scribble Training and Revision-aware Refinement for Interactive 3D Tumor Segmentation},
+  author  = {Hao Li and {others}},
+  journal = {in submission},
+  year    = {2026},
+}
+```

@@ -45,6 +45,14 @@ class MaskDecoder3D(nn.Module):
         if self.args.refine:
             self.refine = Refine(self.args)
 
+        # Multi-scale deep supervision: single-output aux heads at u2 (64^3, 32ch)
+        # and u3 (32^3, 64ch). Driven by the first mask token. Used at training
+        # only; inference uses the main 128^3 head exclusively.
+        if getattr(self.args, "multi_scale_decoder", False):
+            self.ms_mlp_64 = MLP(transformer_dim, transformer_dim, 32, 3)
+            self.ms_mlp_32 = MLP(transformer_dim, transformer_dim, 64, 3)
+        self.last_ms_masks = None
+
     def forward(
         self,
         prompt_embeddings: torch.Tensor, # prompt_embedding --> [b, self.num_mask_tokens, c]
@@ -52,9 +60,29 @@ class MaskDecoder3D(nn.Module):
         feature_list: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        upscaled_embedding = self.decoder(image_embeddings, feature_list)
-        masks, iou_pred = self._predict_mask(upscaled_embedding, prompt_embeddings)
+        ms_on = getattr(self.args, "multi_scale_decoder", False)
+        if ms_on:
+            u1, u2, u3 = self.decoder(image_embeddings, feature_list, return_multiscale=True)
+        else:
+            u1 = self.decoder(image_embeddings, feature_list)
+
+        masks, iou_pred = self._predict_mask(u1, prompt_embeddings)
+
+        if ms_on:
+            mask_token_0 = prompt_embeddings[:, 1, :]  # first mask token drives aux heads
+            masks_64 = self._predict_aux_mask(u2, mask_token_0, self.ms_mlp_64)
+            masks_32 = self._predict_aux_mask(u3, mask_token_0, self.ms_mlp_32)
+            self.last_ms_masks = (masks_64, masks_32)
+        else:
+            self.last_ms_masks = None
+
         return masks, iou_pred
+
+    def _predict_aux_mask(self, embedding, mask_token, mlp):
+        b, c, x, y, z = embedding.shape
+        hyper_in = mlp(mask_token).unsqueeze(1)  # [b, 1, c]
+        masks = (hyper_in @ embedding.view(b, c, x * y * z)).view(b, 1, x, y, z)
+        return masks
 
 
     def _predict_mask(self, upscaled_embedding, prompt_embeddings):
@@ -101,6 +129,10 @@ class Refine(nn.Module):
         super().__init__()
         self.args = args
 
+        # 3-state click memory adds a contradiction_map channel (image, mask, pos, neg, contra) = 5
+        if getattr(args, "use_3state_memory", False):
+            in_channel = 5
+
         self.first_conv = Conv["conv", 3](in_channels=in_channel, out_channels=out_channel, kernel_size=1)
 
         self.conv1 = TwoConv(spatial_dims, out_channel, out_channel, act, norm, bias, dropout)
@@ -140,32 +172,61 @@ class Refine(nn.Module):
 
         coors, labels = points[0], points[1]
         positive_map, negative_map = torch.zeros_like(image), torch.zeros_like(image)
+        use_3state = getattr(self.args, "use_3state_memory", False)
+        contradiction_map = torch.zeros_like(image) if use_3state else None
+        # last_label tracks the most recent click label per voxel (-1 unclicked, 0 neg, 1 pos)
+        last_label = torch.full(
+            (image.size(0), image.size(2), image.size(3), image.size(4)),
+            -1, dtype=torch.int8, device=image.device,
+        ) if use_3state else None
 
         for click_iters in range(len(coors)):
             coors_click, labels_click = coors[click_iters], labels[click_iters]
             for batch in range(image.size(0)):
                 point_label = labels_click[batch]
                 coor = coors_click[batch]
-                # sepehre_coor = [coor[:, 0], coor[:, 1], coor[:, 2]]
 
-                # Create boolean masks
-                negative_mask = point_label == 0
-                positive_mask = point_label != 0
+                if use_3state:
+                    # Latest-write-wins + contradiction tag (vectorized within iter).
+                    if coor.shape[0] > 0:
+                        d_idx = coor[:, 0].long()
+                        h_idx = coor[:, 1].long()
+                        w_idx = coor[:, 2].long()
+                        lbl = point_label.long().to(image.device)
+                        prev = last_label[batch, d_idx, h_idx, w_idx]
+                        contradicted = (prev != -1) & (prev != lbl.to(torch.int8))
+                        if contradicted.any():
+                            cd, ch, cw = d_idx[contradicted], h_idx[contradicted], w_idx[contradicted]
+                            contradiction_map[batch, 0, cd, ch, cw] = 1
+                            positive_map[batch, 0, cd, ch, cw] = 0
+                            negative_map[batch, 0, cd, ch, cw] = 0
+                        is_pos = lbl == 1
+                        if is_pos.any():
+                            pd, ph, pw = d_idx[is_pos], h_idx[is_pos], w_idx[is_pos]
+                            positive_map[batch, 0, pd, ph, pw] = 1
+                        is_neg = ~is_pos
+                        if is_neg.any():
+                            nd, nh, nw = d_idx[is_neg], h_idx[is_neg], w_idx[is_neg]
+                            negative_map[batch, 0, nd, nh, nw] = 1
+                        last_label[batch, d_idx, h_idx, w_idx] = lbl.to(torch.int8)
+                else:
+                    # PRISM original: vector ops, but writes pos=neg=1 if same voxel reappears with opposite label
+                    negative_mask = point_label == 0
+                    positive_mask = point_label != 0
+                    if negative_mask.any():
+                        negative_indices = coor[negative_mask]
+                        for idx in negative_indices:
+                            negative_map[batch, 0, idx[0], idx[1], idx[2]] = 1
+                    if positive_mask.any():
+                        positive_indices = coor[positive_mask]
+                        for idx in positive_indices:
+                            positive_map[batch, 0, idx[0], idx[1], idx[2]] = 1
 
-                # Update negative_map
-                if negative_mask.any():  # Check if there's at least one True in negative_mask
-                    negative_indices = coor[negative_mask]
-                    for idx in negative_indices:
-                        negative_map[batch, 0, idx[0], idx[1], idx[2]] = 1
-
-                # Update positive_map
-                if positive_mask.any():  # Check if there's at least one True in negative_mask
-                    positive_indices = coor[positive_mask]
-                    for idx in positive_indices:
-                        positive_map[batch, 0, idx[0], idx[1], idx[2]] = 1
-
-
-        refine_input = F.interpolate(torch.cat([image, mask, positive_map, negative_map], dim=1), scale_factor=0.5, mode='trilinear')
+        if use_3state:
+            stacked = torch.cat([image, mask, positive_map, negative_map, contradiction_map], dim=1)
+        else:
+            stacked = torch.cat([image, mask, positive_map, negative_map], dim=1)
+        refine_input = F.interpolate(stacked, scale_factor=0.5, mode='trilinear')
         return refine_input
 
 class MLP(nn.Module):

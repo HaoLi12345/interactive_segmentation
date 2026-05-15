@@ -1,5 +1,6 @@
 from abc import abstractmethod
 import torch
+import torch.nn.functional as F
 import numpy as np
 from torch.optim import AdamW, lr_scheduler
 from src.config.config_setup import build_model, get_dataloader
@@ -184,7 +185,7 @@ class Trainer_basic(object):
         return dice_list
 
 
-    def calculate_loss(self, mask, prev_masks, pred_dice, label, labels_input, iter_num, inter=False):
+    def calculate_loss(self, mask, prev_masks, pred_dice, label, labels_input, iter_num, inter=False, ms_masks=None):
         mask_probs, prev_masks_prob = torch.sigmoid(mask), torch.sigmoid(prev_masks)
 
         seg_edge = abs(label - self.pooling_layer(label))
@@ -200,7 +201,23 @@ class Trainer_basic(object):
 
         loss = self.loss_segmentation(mask, label) + self.loss_boundary(mask_edge, seg_edge) * 10
         loss = loss + pred_dice_score_loss
+
+        if ms_masks is not None:
+            masks_64, masks_32 = ms_masks
+            label_64 = F.interpolate(label.float(), scale_factor=0.5, mode="nearest")
+            label_32 = F.interpolate(label.float(), scale_factor=0.25, mode="nearest")
+            w64, w32 = self._ms_aux_weights()
+            loss = loss + w64 * self.loss_segmentation(masks_64, label_64)
+            loss = loss + w32 * self.loss_segmentation(masks_32, label_32)
         return loss
+
+    def _ms_aux_weights(self):
+        if not hasattr(self, "_ms_aux_weights_cache"):
+            spec = getattr(self.args, "ms_aux_weights", "0.5,0.25")
+            parts = [float(w.strip()) for w in spec.split(",")]
+            assert len(parts) == 2, f"--ms_aux_weights must have 2 values (got {parts})"
+            self._ms_aux_weights_cache = tuple(parts)
+        return self._ms_aux_weights_cache
 
     def get_dice_score(self, prev_masks, label, batch=False):
         def compute_dice(mask_pred, mask_gt):

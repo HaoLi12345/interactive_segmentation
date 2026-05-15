@@ -44,6 +44,8 @@ parser.add_argument('--num_clicks_validation', type=int, default=10)
 parser.add_argument('--use_box', action="store_true")
 parser.add_argument('--dynamic_box', action="store_true")
 parser.add_argument('--use_scribble', action="store_true")
+parser.add_argument('--click_strategy', default='random', choices=['random', 'entropy'],
+                    help='How to pick the next click voxel within FN/FP regions. random=PRISM default; entropy=top-k by binary entropy of prev prediction.')
 
 
 parser.add_argument('--num_multiple_outputs', type=int, default=3)
@@ -55,6 +57,42 @@ parser.add_argument('--refine_test', action="store_true")
 parser.add_argument('--dynamic', action="store_true")
 parser.add_argument('--efficient_scribble', action="store_true")
 parser.add_argument("--use_sam3d_turbo", action="store_true")
+
+parser.add_argument('--multi_scale_decoder', action='store_true',
+                    help='Add 64^3 + 32^3 deep-supervision aux heads on the mask decoder. Inference unchanged.')
+parser.add_argument('--ms_aux_weights', default='0.5,0.25', type=str,
+                    help='Comma-separated aux loss weights for (64^3, 32^3) scales. Main 128^3 weight is fixed at 1.0.')
+
+parser.add_argument('--scribble_every_k_slices', default=0, type=int,
+                    help='Test-time only: keep scribble voxels only on every k-th axial slice (D axis, dim 0). 0 = no filtering.')
+
+parser.add_argument('--use_3state_memory', action='store_true',
+                    help='Refine head: use 3-state click memory (positive/negative/contradicted maps). Adds 1 channel to refine input. '
+                         'Without this flag, PRISM original behavior: same voxel can have positive_map=1 AND negative_map=1 simultaneously.')
+
+parser.add_argument('--sparse_scribble_train', action='store_true',
+                    help='Train-time only: enable scribble in get_points and apply random-orientation top-K-error slice filter. '
+                         'Mutually requires --use_scribble.')
+parser.add_argument('--sparse_scribble_dense_prob', default=0.2, type=float,
+                    help='Per-iter probability of using full (dense) scribble (K=infinity); otherwise sample K from [1, K_max].')
+parser.add_argument('--sparse_scribble_K_max', default=5, type=int,
+                    help='When sampling sparse K, K ~ Uniform[1, K_max].')
+parser.add_argument('--sparse_scribble_orientations', default='axial,sagittal,coronal', type=str,
+                    help='Comma-separated orientations to randomize over: axial=dim0, sagittal=dim1, coronal=dim2.')
+
+parser.add_argument('--test_K_slices', default=0, type=int,
+                    help='Test-time top-K-error slice filter (replaces deprecated --scribble_every_k_slices when >0).')
+parser.add_argument('--test_slice_orientation', default='axial', type=str, choices=['axial', 'sagittal', 'coronal', 'random'],
+                    help='Test-time slice orientation for K-slice filter.')
+parser.add_argument('--test_contradiction_rate', default=0.0, type=float,
+                    help='Test-time only: probability of flipping a click label per iter (simulates user changing mind).')
+parser.add_argument('--force_inter_iter_contradiction', action='store_true',
+                    help='[DEPRECATED, use --inter_iter_contradiction_N instead] Test-time: at iter k>=1, replace one click with a previous-iter voxel with flipped label.')
+parser.add_argument('--save_per_iter_predictions', action='store_true',
+                    help='Test-time: save per-iter mask + (once) image + GT as nii.gz under save_test_dir/per_iter_pred/<data>/<save_name>/<case>/.')
+parser.add_argument('--inter_iter_contradiction_N', default=0, type=int,
+                    help='Test-time: at iter k>=1, sample N random voxels from a previous iters prompt pool (mostly scribble), '
+                         'flip labels, append to current iter. Triggers PRISM refine-head pos_map=neg_map=1 bug at scale.')
 
 
 

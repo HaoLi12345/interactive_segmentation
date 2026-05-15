@@ -70,6 +70,7 @@ class Tester(object):
                 if subject_dict['label']['data'][0].sum() <= 0:
                     self.logger.info(image_path, 'label volume too small, and it has been skipped for validation')
                     continue
+                self._current_image_path = str(image_path[0]) if hasattr(image_path, "__getitem__") else str(image_path)
                 mean_dice = 0
                 subject = tio.Subject(image=tio.ScalarImage(tensor=subject_dict['image']['data'][0].float(), affine=subject_dict['image']['affine'][0]),
                                       label=tio.LabelMap(tensor=subject_dict['label']['data'][0].float(), affine=subject_dict['label']['affine'][0]))
@@ -179,6 +180,7 @@ class Tester(object):
             for idx, (image, label, image_path, subject_dict_save) in enumerate(self.val_data):
 
                 image, label = image.to(device), label.to(device)
+                self._current_image_path = str(image_path[0]) if hasattr(image_path, "__getitem__") else str(image_path)
 
                 if self.args.data == 'kits' and image.size(1) > 1:
                     label_final, masks_final = torch.zeros([1, 1, int(image.size(2) * 2), image.size(3), image.size(4)]), torch.zeros([self.args.iter_nums, 1, int(image.size(2) * 2), image.size(3), image.size(4)])
@@ -271,6 +273,31 @@ class Tester(object):
 
         return loss_summary
 
+    def _test_filter_topk_slices(self, coors, error_mask_chw, K):
+        """Test-time top-K-error slice filter (mirrors trainer M2 path).
+        coors: (1, N, 3) layout (D, H, W).
+        error_mask_chw: (C, D, H, W) FN or FP mask.
+        Picks orientation per --test_slice_orientation: axial=0, sagittal=1, coronal=2,
+        random = uniform random per call.
+        """
+        if K < 1 or coors.size(1) == 0:
+            return coors
+        orient = getattr(self.args, "test_slice_orientation", "axial")
+        dim_map = {"axial": 0, "sagittal": 1, "coronal": 2}
+        if orient == "random":
+            dim_idx = random.choice([0, 1, 2])
+        else:
+            dim_idx = dim_map.get(orient, 0)
+        err = error_mask_chw.float()
+        sum_axes = tuple([0] + [d for d in (1, 2, 3) if d != dim_idx + 1])
+        per_slice = err.sum(dim=sum_axes)
+        K_eff = min(K, int((per_slice > 0).sum().item()) or per_slice.size(0))
+        K_eff = max(1, K_eff)
+        topk = torch.topk(per_slice, K_eff).indices.to(coors.device)
+        coor_dim = coors[0, :, dim_idx]
+        mask = torch.isin(coor_dim, topk)
+        return coors[:, mask, :]
+
     def get_next_click3D_torch_2(self, prev_seg, gt_semantic_seg):
 
         mask_threshold = 0.5
@@ -297,15 +324,34 @@ class Tester(object):
 
             dynamic_size = random.randint(1, click_size) if self.args.dynamic else click_size
 
-            point_index = np.random.choice(len(points), size=dynamic_size, replace=False)
+            # Click strategy: 'random' (PRISM default) vs 'entropy' (ours).
+            # Entropy picks the top-k voxels in FN/FP region with highest binary
+            # entropy of the previous prediction — i.e. where the model is most
+            # uncertain. At iter 0 prev_seg is all zero so entropy is 0
+            # everywhere; degenerates to argmax which is arbitrary order — same
+            # as random. From iter >= 1 it focuses on uncertain frontiers.
+            if getattr(self.args, "click_strategy", "random") == "entropy":
+                eps = 1e-6
+                p = prev_seg[i].clamp(eps, 1 - eps)
+                # points has shape (N, 4) = (channel=0, d, h, w)
+                p_at = p[points[:, 0], points[:, 1], points[:, 2], points[:, 3]]
+                entropy = -(p_at * torch.log(p_at) + (1 - p_at) * torch.log(1 - p_at))
+                point_index = torch.topk(entropy, dynamic_size, largest=True).indices.cpu().numpy()
+            else:
+                point_index = np.random.choice(len(points), size=dynamic_size, replace=False)
             points_select = points[point_index]  # each row tensor([0, x, y, z]), size --> num_clicks x 4
             # point = points[np.random.randint(len(points))] # tensor([0, x, y, z])
+            contra_p = float(getattr(self.args, "test_contradiction_rate", 0.0))
             for click_index in range(dynamic_size):
                 point = points_select[click_index]
                 if fn_masks[i, 0, point[1], point[2], point[3]]:
                     is_positive = True
                 else:
                     is_positive = False
+
+                # Test-time contradiction injection: simulate a user changing their mind.
+                if contra_p > 0.0 and random.random() < contra_p:
+                    is_positive = not is_positive
 
                 bp = point[1:].clone().detach().reshape(1, 1, 3)
                 bl = torch.tensor([int(is_positive), ]).reshape(1, 1)
@@ -333,25 +379,38 @@ class Tester(object):
                 scribble_type = scribble_types.get(sample_method, scribble_types['default'])
 
                 scribble_mask_fg = create_scribble_mask(scribble_type, fg)
-                #fg_coors = torch.argwhere(scribble_mask_fg)[:, 1:].unsqueeze(0)[:, 0: 100, :]  # for computation only
                 fg_coors = torch.argwhere(scribble_mask_fg)[:, 1:].unsqueeze(0)
-                if self.args.efficient_scribble:
-                    fg_coors = fg_coors[:, 0: 10000, :]  # for computation only# for computation only
-                fg_coors_label = torch.ones(1, fg_coors.size(1))
-                bp_list.append(fg_coors)
-                bl_list.append(fg_coors_label)
-                # x,y,z = bp_list[-1][0, 99, 0], bp_list[-1][0, 99, 1], bp_list[-1][0, 99, 2]
-                # print(gt_semantic_seg[i, 0, x,y,z])
 
-                #if sample_method == 'default':
+                # New: top-K-error slice filter (mirrors trainer M2 path).
+                test_K = int(getattr(self.args, "test_K_slices", 0))
+                if test_K > 0 and fg_coors.size(1) > 0:
+                    fg_coors = self._test_filter_topk_slices(fg_coors, fn_masks[i], test_K)
+                # Legacy: axial mod-K filter (kept for backwards compatibility, lower priority).
+                k_slice = int(getattr(self.args, "scribble_every_k_slices", 0))
+                if test_K == 0 and k_slice > 0 and fg_coors.size(1) > 0:
+                    keep = (fg_coors[0, :, 0] % k_slice == 0)
+                    fg_coors = fg_coors[:, keep, :]
+                if self.args.efficient_scribble:
+                    fg_coors = fg_coors[:, 0: 10000, :]
+                if fg_coors.size(1) > 0:
+                    fg_coors_label = torch.ones(1, fg_coors.size(1))
+                    bp_list.append(fg_coors)
+                    bl_list.append(fg_coors_label)
+
                 if torch.count_nonzero(fp_masks) > 0:
                     scribble_mask_bg = create_scribble_mask(scribble_type, bg)
                     bg_coors = torch.argwhere(scribble_mask_bg)[:, 1:].unsqueeze(0)
+                    if test_K > 0 and bg_coors.size(1) > 0:
+                        bg_coors = self._test_filter_topk_slices(bg_coors, fp_masks[i], test_K)
+                    if test_K == 0 and k_slice > 0 and bg_coors.size(1) > 0:
+                        keep = (bg_coors[0, :, 0] % k_slice == 0)
+                        bg_coors = bg_coors[:, keep, :]
                     if self.args.efficient_scribble:
                         bg_coors = bg_coors[:, 0: 10000, :]
-                    bg_coors_label = torch.zeros(1, bg_coors.size(1))
-                    bp_list.append(bg_coors)
-                    bl_list.append(bg_coors_label)
+                    if bg_coors.size(1) > 0:
+                        bg_coors_label = torch.zeros(1, bg_coors.size(1))
+                        bp_list.append(bg_coors)
+                        bl_list.append(bg_coors_label)
 
             batch_points.append(torch.cat(bp_list, dim=1))
             batch_labels.append(torch.cat(bl_list, dim=1))
@@ -374,6 +433,30 @@ class Tester(object):
 
         points_co = torch.cat(batch_points, dim=0).to(self.args.device)
         points_la = torch.cat(batch_labels, dim=0).to(self.args.device)
+
+        # Inter-iter contradiction (N-voxel scribble overlap): at iter k>=1, sample N
+        # random voxels from a previous iter's prompt pool (which is dominated by
+        # scribble at iter > 0), flip their labels, and APPEND to current iter's
+        # prompts. This places N voxels with a label opposite to their previous-iter
+        # label into the click history. PRISM's refine head will write positive_map=1
+        # AND negative_map=1 at these N voxels (the bug); our 3-state memory will
+        # raise contradiction_map and keep the latest label.
+        N_contra = int(getattr(self.args, "inter_iter_contradiction_N", 0))
+        if N_contra > 0 and len(self.click_points) > 0:
+            prev_iter_idx = random.randint(0, len(self.click_points) - 1)
+            prev_co = self.click_points[prev_iter_idx]
+            prev_la = self.click_labels[prev_iter_idx]
+            M = prev_co.size(1)
+            if M > 0:
+                if N_contra <= M:
+                    perm = torch.randperm(M, device=prev_co.device)[:N_contra]
+                else:
+                    perm = torch.randint(0, M, (N_contra,), device=prev_co.device)
+                sampled_co = prev_co[:, perm, :].clone()
+                sampled_la = prev_la[:, perm].clone()
+                flipped_la = 1 - sampled_la
+                points_co = torch.cat([points_co, sampled_co.to(points_co.device)], dim=1)
+                points_la = torch.cat([points_la, flipped_la.to(points_la.device)], dim=1)
 
         self.click_points.append(points_co)
         self.click_labels.append(points_la)
@@ -436,6 +519,28 @@ class Tester(object):
             dice = self.get_dice_score(torch.sigmoid(prev_masks).cpu().numpy(), label.cpu().numpy())
             print('---')
             print(f'Dice: {dice:.4f}, pred_dice: {pred_best_dice}, label: {labels_input}')
+            try:
+                _img_path = self._current_image_path if hasattr(self, "_current_image_path") else ""
+            except Exception:
+                _img_path = ""
+            self.logger.info("ITERDICE path={} iter={} dice={:.6f}".format(_img_path, iter_num, float(dice)))
+
+            if getattr(self.args, "save_per_iter_predictions", False):
+                import SimpleITK as sitk
+                _b = _img_path.split("/")[-1].replace(".nii.gz", ""); base = _img_path.split("/")[-2] if _b == "imaging" else _b
+                d = os.path.join(self.args.save_test_dir, "per_iter_pred", self.args.data, self.args.save_name, base)
+                if not os.path.exists(d):
+                    os.makedirs(d, exist_ok=True)
+                pred_arr = (torch.sigmoid(prev_masks) > 0.5)[0, 0].float().cpu().numpy()
+                sitk.WriteImage(sitk.GetImageFromArray(pred_arr), os.path.join(d, "pred_iter{:02d}.nii.gz".format(iter_num)))
+                # Save accumulated click history per iter (used to reconstruct contradiction voxels offline).
+                torch.save({
+                    "click_points": [cp.detach().cpu() for cp in self.click_points],
+                    "click_labels": [cl.detach().cpu() for cl in self.click_labels],
+                }, os.path.join(d, "clicks_iter{:02d}.pt".format(iter_num)))
+                if iter_num == 0:
+                    sitk.WriteImage(sitk.GetImageFromArray(image[0, 0].float().cpu().numpy()), os.path.join(d, "image.nii.gz"))
+                    sitk.WriteImage(sitk.GetImageFromArray(label[0, 0].float().cpu().numpy()), os.path.join(d, "label.nii.gz"))
 
         return prev_masks
 
@@ -487,6 +592,12 @@ class Tester(object):
                 mask_best = mask_refine  # FIXME refine or not
 
             loss = self.get_dice_score(torch.sigmoid(mask_best), label) # dice
+            # Per-iter clean log line for case-level trajectory analysis (paper figure).
+            try:
+                _img_path = self._current_image_path if hasattr(self, "_current_image_path") else ""
+            except Exception:
+                _img_path = ""
+            self.logger.info("ITERDICE path={} iter={} dice={:.6f}".format(_img_path, iter_num, float(loss)))
 
             return_loss += loss
             prev_masks = mask_best

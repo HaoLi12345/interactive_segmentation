@@ -27,6 +27,9 @@ class Trainer(Trainer_basic):
             mask, dice_pred = self.iteration_forward(sam_model, feature_list, image_embedding, prev_masks,
                                                      points=[points_input, labels_input], boxes=box_input)
 
+            decoder_module = sam_model.module.mask_decoder if hasattr(sam_model, "module") else sam_model.mask_decoder
+            ms_masks = getattr(decoder_module, "last_ms_masks", None)
+
             # ========================================================
             if self.args.multiple_outputs:
                 dice_pred_best, max_label_index = torch.max(dice_pred, dim=1)
@@ -40,9 +43,11 @@ class Trainer(Trainer_basic):
                 if self.args.multiple_outputs:
                     for i in range(mask.size(1)):
                         single_mask, single_dice = mask[:, i, :].unsqueeze(1), dice_pred[:, i]
-                        loss += self.calculate_loss(single_mask, prev_masks, single_dice, label, labels_input, iter_num)
+                        # ms_masks aux loss is added once per iter (only on first hypothesis)
+                        ms = ms_masks if i == 0 else None
+                        loss += self.calculate_loss(single_mask, prev_masks, single_dice, label, labels_input, iter_num, ms_masks=ms)
                 else:
-                    loss = self.calculate_loss(mask, prev_masks, dice_pred[:, 0], label, labels_input, iter_num)
+                    loss = self.calculate_loss(mask, prev_masks, dice_pred[:, 0], label, labels_input, iter_num, ms_masks=ms_masks)
 
                 # ========================================================
                 if self.args.refine:
@@ -108,6 +113,39 @@ class Trainer(Trainer_basic):
 
         return points_input, labels_input, bbox_coords
 
+    def _sample_sparse_K_and_dim(self, mode):
+        """Returns (K, dim_idx). K=-1 means dense (no filter). dim_idx in {0,1,2}."""
+        if mode != 'train' or not getattr(self.args, "sparse_scribble_train", False):
+            return -1, -1
+        p_dense = getattr(self.args, "sparse_scribble_dense_prob", 0.2)
+        K_max = getattr(self.args, "sparse_scribble_K_max", 5)
+        if random.random() < p_dense:
+            return -1, -1
+        K = random.randint(1, K_max)
+        orient_str = getattr(self.args, "sparse_scribble_orientations", "axial,sagittal,coronal")
+        orient_names = [s.strip() for s in orient_str.split(",") if s.strip()]
+        dim_map = {"axial": 0, "sagittal": 1, "coronal": 2}
+        chosen = random.choice(orient_names) if orient_names else "axial"
+        return K, dim_map.get(chosen, 0)
+
+    def _filter_scribble_topk_slices(self, coors, error_mask_chw, K, dim_idx):
+        """Filter (1, N, 3) scribble coors to top-K-error slices on dim_idx.
+        error_mask_chw shape: (C, D, H, W); coors layout: (D, H, W).
+        Selects K slices with the highest FN+FP voxel count and keeps voxels on those slices.
+        """
+        if K < 1 or coors.size(1) == 0:
+            return coors
+        err = error_mask_chw.float()
+        # sum over all spatial dims except dim_idx (within (D,H,W) = dims 1,2,3 of err)
+        sum_axes = tuple([0] + [d for d in (1, 2, 3) if d != dim_idx + 1])
+        per_slice = err.sum(dim=sum_axes)  # 1D tensor of length = slice count along dim_idx
+        K_eff = min(K, int((per_slice > 0).sum().item()) or per_slice.size(0))
+        K_eff = max(1, K_eff)
+        topk = torch.topk(per_slice, K_eff).indices.to(coors.device)
+        coor_dim = coors[0, :, dim_idx]
+        mask = torch.isin(coor_dim, topk)
+        return coors[:, mask, :]
+
     def get_next_point(self, prev_seg, label, mode='train'): # prev_seg --> probability
         batch_points = []
         batch_labels = []
@@ -119,6 +157,8 @@ class Trainer(Trainer_basic):
 
         to_point_mask = torch.logical_or(fn_masks, fp_masks)
 
+        # Sample K and orientation once per call: per-iter sparsity, all batch items share K.
+        sparse_K, sparse_dim = self._sample_sparse_K_and_dim(mode)
 
         # do_scribble = random.random()
         # sample_method = random.choice(['line', 'center', 'default'])
@@ -146,7 +186,21 @@ class Trainer(Trainer_basic):
             bp_list, bl_list = [], []
             points = torch.argwhere(to_point_mask[i])
 
-            point_index = np.random.choice(len(points), size=dynamic_size, replace=False)
+            # Click strategy: 'random' (PRISM default) vs 'entropy' (ours).
+            # Entropy picks the top-k voxels in FN/FP region with highest binary
+            # entropy of the previous prediction. At iter 0 prev_seg is all zero
+            # so entropy is 0 everywhere -> degenerates to argmax order (similar
+            # to random). From iter >= 1 it focuses on uncertain frontiers, which
+            # is what we want both at train and test time so the prompt
+            # distribution seen during training matches the inference policy.
+            if getattr(self.args, "click_strategy", "random") == "entropy":
+                eps = 1e-6
+                p = prev_seg[i].clamp(eps, 1 - eps)
+                p_at = p[points[:, 0], points[:, 1], points[:, 2], points[:, 3]]
+                entropy = -(p_at * torch.log(p_at) + (1 - p_at) * torch.log(1 - p_at))
+                point_index = torch.topk(entropy, dynamic_size, largest=True).indices.cpu().numpy()
+            else:
+                point_index = np.random.choice(len(points), size=dynamic_size, replace=False)
             points_select = points[point_index] # each row tensor([0, x, y, z]), size --> num_clicks x 4
 
             for click_index in range(dynamic_size):
@@ -186,29 +240,38 @@ class Trainer(Trainer_basic):
                 scribble_mask_fg = create_scribble_mask(scribble_type, fg)
 
                 limit_num = 500
-                if torch.count_nonzero(scribble_mask_fg) >= limit_num + 50:
-                    a = torch.argwhere(scribble_mask_fg).size(0) - limit_num
+                fg_coors_full = torch.argwhere(scribble_mask_fg)[:, 1:].unsqueeze(0)
+                # Sparse-K-slice filter: keep voxels on top-K-error slices in chosen orientation.
+                if sparse_K > 0 and fg_coors_full.size(1) > 0:
+                    fg_coors_full = self._filter_scribble_topk_slices(fg_coors_full, fn_masks[i], sparse_K, sparse_dim)
+                if fg_coors_full.size(1) >= limit_num + 50:
+                    a = fg_coors_full.size(1) - limit_num
                     random_number = random.randint(0, a)
-                    fg_coors = torch.argwhere(scribble_mask_fg)[:, 1:].unsqueeze(0)[:, random_number: random_number + limit_num, :] # for computation only
+                    fg_coors = fg_coors_full[:, random_number: random_number + limit_num, :]
                 else:
-                    fg_coors = torch.argwhere(scribble_mask_fg)[:, 1:].unsqueeze(0)
+                    fg_coors = fg_coors_full
 
                 fg_coors_label = torch.ones(1, fg_coors.size(1))
-                bp_list.append(fg_coors)
-                bl_list.append(fg_coors_label)
+                if fg_coors.size(1) > 0:
+                    bp_list.append(fg_coors)
+                    bl_list.append(fg_coors_label)
 
 
                 scribble_mask_bg = create_scribble_mask(scribble_type, bg)
-                if torch.count_nonzero(scribble_mask_bg) >= limit_num + 50: # dynamic_size is 50
-                    a = torch.argwhere(scribble_mask_bg).size(0) - limit_num
+                bg_coors_full = torch.argwhere(scribble_mask_bg)[:, 1:].unsqueeze(0)
+                if sparse_K > 0 and bg_coors_full.size(1) > 0:
+                    bg_coors_full = self._filter_scribble_topk_slices(bg_coors_full, fp_masks[i], sparse_K, sparse_dim)
+                if bg_coors_full.size(1) >= limit_num + 50:
+                    a = bg_coors_full.size(1) - limit_num
                     random_number = random.randint(0, a)
-                    bg_coors = torch.argwhere(scribble_mask_bg)[:, 1:].unsqueeze(0)[:, random_number: random_number + limit_num, :]
+                    bg_coors = bg_coors_full[:, random_number: random_number + limit_num, :]
                 else:
-                    bg_coors = torch.argwhere(scribble_mask_bg)[:, 1:].unsqueeze(0)
+                    bg_coors = bg_coors_full
 
                 bg_coors_label = torch.zeros(1, bg_coors.size(1))
-                bp_list.append(bg_coors)
-                bl_list.append(bg_coors_label)
+                if bg_coors.size(1) > 0:
+                    bp_list.append(bg_coors)
+                    bl_list.append(bg_coors_label)
 
             batch_points.append(torch.cat(bp_list, dim=1))
             batch_labels.append(torch.cat(bl_list, dim=1))

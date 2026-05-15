@@ -198,7 +198,7 @@ class Unet_decoder(nn.Module):
 
         self.final_conv = Conv["conv", spatial_dims](fea[5], out_channels, kernel_size=1)
 
-    def forward(self, image_embeddings, feature_list):
+    def forward(self, image_embeddings, feature_list, return_multiscale=False):
         x4, x3, x2, x1, x0 = image_embeddings, feature_list[3], feature_list[2], feature_list[1], feature_list[0]
         u4 = self.upcat_4(x4, x3)
         u3 = self.upcat_3(u4, x2)
@@ -206,6 +206,8 @@ class Unet_decoder(nn.Module):
         u1 = self.upcat_1(u2, x0)
 
         # logits = self.final_conv(u1)
+        if return_multiscale:
+            return u1, u2, u3
         return u1
 
 class Unet_encoder(nn.Module):
